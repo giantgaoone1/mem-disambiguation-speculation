@@ -37,6 +37,172 @@ Figure 3 demonstrates a fundamental challenge in modern superscalar processors: 
    - With speculation: The processor can execute the load early, risking mis-speculation
    - This trade-off is central to modern processor performance
 
+## Static vs. Dynamic Dependence Edges
+
+Before diving into Figure 3's parts, it's crucial to understand the distinction between **static** and **dynamic** dependence edges, as this is central to why speculation is both necessary and challenging.
+
+### Static Dependence Edges
+
+**Definition**: Potential dependencies identified at **compile-time** through static analysis of the program code.
+
+**Characteristics**:
+- **Conservative**: Compiler must assume dependence when it cannot prove independence
+- **Address-agnostic**: Based on syntactic program structure, not actual runtime addresses
+- **Fixed**: Does not change during program execution
+- **Complete**: Covers all possible execution paths
+
+**Example in Figure 3 Context**:
+```c
+void example(int *a, int *b, int n) {
+    for (int i = 0; i < n; i++) {
+        a[i] = compute(i);      // Store S at PC=0x1000
+        x = b[i];               // Load L at PC=0x1008
+    }
+}
+```
+
+**Static Analysis Result**:
+- Compiler sees: Store to `a[i]` followed by Load from `b[i]`
+- **Cannot determine** if `a` and `b` alias (point to same memory)
+- **Must assume**: Static dependence edge S → L exists
+- **Conservative decision**: Load must wait for Store
+
+**Why Static Analysis is Insufficient**:
+1. **Pointer aliasing**: `a` and `b` determined at runtime
+2. **Array indexing**: Actual addresses depend on `i` and base addresses
+3. **Performance cost**: Forcing all loads to wait destroys ILP
+
+### Dynamic Dependence Edges
+
+**Definition**: Actual dependencies that occur at **runtime** based on real memory addresses during program execution.
+
+**Characteristics**:
+- **Precise**: Based on actual addresses computed during execution
+- **Variable**: Can change between iterations or invocations
+- **Partial**: Only applies to executed paths, not all possible paths
+- **Observable**: Can be monitored and learned from
+
+**Example in Figure 3 Context**:
+Using the same code above with specific runtime values:
+
+**Scenario 1**: `a` and `b` point to different arrays
+```
+Runtime: a = 0x10000, b = 0x20000, n = 100
+Iteration i=0:
+  - Store writes to: a[0] = 0x10000
+  - Load reads from: b[0] = 0x20000
+  - Addresses differ → NO dynamic dependence edge
+  - Load could have executed speculatively (safe)
+```
+
+**Scenario 2**: `a` and `b` alias with offset
+```
+Runtime: a = 0x10000, b = 0x10000 - 8 (b points to a[-1])
+Iteration i=5:
+  - Store writes to: a[5] = 0x10028
+  - Load reads from: b[5] = 0x10020 (which is a[4])
+  - Different addresses → NO dynamic dependence
+  
+Iteration i=6:
+  - Store writes to: a[6] = 0x10030
+  - Load reads from: b[6] = 0x10028 (which is a[5])
+  - SAME address as previous store → Dynamic dependence edge S[i] → L[i+1]
+```
+
+### Static vs. Dynamic in Figure 3
+
+**Figure 3's Central Challenge**: 
+The processor must handle the gap between static (conservative) and dynamic (actual) dependences.
+
+| Aspect | Static Dependence Edge | Dynamic Dependence Edge |
+|--------|------------------------|-------------------------|
+| **Determined** | Compile-time | Runtime |
+| **Basis** | Program syntax | Actual addresses |
+| **Coverage** | All possible paths | Executed path only |
+| **Accuracy** | Conservative (over-approximation) | Precise (exact) |
+| **Changes** | Never | Per execution instance |
+| **Performance** | Safe but slow | Fast when predicted correctly |
+
+### How Figure 3 Addresses This Gap
+
+**Part (a) - Static Approach**:
+- Respects all static dependence edges
+- Load always waits for all preceding stores
+- Performance: Poor (serialization)
+- Correctness: Guaranteed
+
+**Part (b) - Dynamic Speculation**:
+- **Predicts** which static edges will become dynamic edges
+- Uses MDPT to track historical dynamic dependence behavior
+- Load speculatively assumes no dynamic dependence
+- Performance: High (when prediction correct)
+- Correctness: Requires verification
+
+**Part (c) - Dynamic Verification**:
+- **Detects** actual dynamic dependence edges at runtime
+- Compares store and load addresses after execution
+- Identifies when static edge became dynamic edge
+- Triggers recovery if speculation violated actual dynamic dependence
+
+**Part (d) - Learning and Synchronization**:
+- **Records** observed dynamic dependence edges
+- Updates MDPT with pattern: "PC_store → PC_load often has dynamic dependence"
+- Future executions: Enforce synchronization for learned patterns
+- Adaptive: Converts static over-approximation to learned dynamic patterns
+
+### Concrete Example from Figure 3
+
+**Code Pattern**:
+```assembly
+0x1000: ST  R1, [R2]      ; Store instruction
+0x1004: ADD R3, R3, #4    ; Intervening work
+0x1008: LD  R4, [R5]      ; Load instruction
+```
+
+**Static Dependence Analysis**:
+```
+Compiler sees: ST [R2] → LD [R5]
+Static edge: Exists (conservative - cannot prove [R2] ≠ [R5])
+```
+
+**Dynamic Dependence - Case 1** (No actual dependence):
+```
+Runtime: R2 = 0x1000, R5 = 0x2000
+Store writes: 0x1000
+Load reads:   0x2000
+Dynamic edge: Does NOT exist
+Speculation: Safe to execute load early
+```
+
+**Dynamic Dependence - Case 2** (Actual dependence):
+```
+Runtime: R2 = 0x1000, R5 = 0x1000
+Store writes: 0x1000
+Load reads:   0x1000 (same location!)
+Dynamic edge: EXISTS
+Speculation: Violation if load executed before store
+Recovery: Required (Part d)
+Learning: Update MDPT entry for (PC=0x1000, PC=0x1008)
+```
+
+### Key Insight
+
+**Figure 3's contribution**: Transform static over-approximation into **learned dynamic prediction**
+
+```
+Static Analysis:          "Might depend" (always conservative)
+         ↓
+Dynamic Speculation:      "Predict based on history"
+         ↓
+Runtime Verification:     "Check actual addresses"
+         ↓
+Adaptive Learning:        "Remember patterns"
+         ↓
+Optimized Execution:      "Near-optimal with correctness"
+```
+
+The paper's innovation is enabling processors to **discover and exploit** the difference between static (possible) and dynamic (actual) dependences, achieving both high performance and correctness.
+
 ## Deep Dive: Figure 3 Parts (b), (c), and (d)
 
 Figure 3 illustrates the complete lifecycle of memory dependence speculation and synchronization. Let's examine each part in detail:
