@@ -37,6 +37,59 @@ Figure 3 demonstrates a fundamental challenge in modern superscalar processors: 
    - With speculation: The processor can execute the load early, risking mis-speculation
    - This trade-off is central to modern processor performance
 
+## Deep Dive: Figure 3 Parts (b), (c), and (d)
+
+Figure 3 illustrates the complete lifecycle of memory dependence speculation and synchronization. Let's examine each part in detail:
+
+### Part (a): The Baseline Case
+The baseline shows a simple store-load sequence where the processor must conservatively assume potential dependence, forcing the load to wait for all preceding stores to complete their address calculation and execution.
+
+### Part (b): Speculative Execution with Prediction
+**Key Mechanism**: The processor uses history-based prediction to guess whether the load depends on the store.
+
+**What happens**:
+1. **Prediction Phase**: When the load instruction is fetched, the MDPT (Memory Dependence Prediction Table) is consulted
+2. **Decision**: Based on past behavior:
+   - If history shows independence → Load proceeds speculatively
+   - If history shows dependence → Load waits for specific store
+3. **Speculative Execution**: The load executes early, potentially before store addresses are known
+4. **Benefit**: Instructions dependent on the load can also proceed, maintaining high ILP
+
+**Critical Insight**: This part shows that not all loads need to wait for all stores—only for the stores they actually depend on (if any).
+
+### Part (c): Verification and Mis-speculation Detection
+**Key Mechanism**: Hardware checks whether the speculation was correct when store addresses become available.
+
+**What happens**:
+1. **Address Calculation**: As stores complete their address calculation, the processor knows where they write
+2. **Conflict Detection**: The Load/Store Queue (LSQ) compares:
+   - Store addresses that completed after the load executed
+   - The address the load used
+3. **Outcome**:
+   - **No Match**: Speculation was correct, continue execution
+   - **Match Found**: Mis-speculation detected, must recover
+
+**Hardware Components**:
+- **Store Queue**: Tracks all pending stores with their addresses
+- **Load Queue**: Tracks executed loads for verification
+- **Comparators**: Check for address matches in parallel
+
+### Part (d): Synchronization and Recovery
+**Key Mechanism**: When mis-speculation is detected, the MDST (Memory Dependence Synchronization Table) manages recovery.
+
+**What happens**:
+1. **Violation Detection**: Hardware identifies that load read wrong value
+2. **Recovery Actions**:
+   - **Pipeline Flush**: Squash the load and all dependent instructions
+   - **PC Restore**: Roll back to the load instruction
+   - **Re-execution**: Execute load again with correct data (forwarded from store or from memory)
+3. **Learning Phase**: Update MDPT to prevent future mis-speculation
+   - Record the store-load pair that caused violation
+   - Increase confidence that these instructions are dependent
+4. **Future Prevention**: Next time this load executes, it will wait for the identified store
+
+**Critical Insight**: Part (d) shows that speculation is not just about being fast—it's about being fast on average while maintaining correctness always.
+
 ## The Scenario Illustrated
 
 ### Typical Instruction Sequence
@@ -138,24 +191,241 @@ The Figure 3 scenario occurs frequently because:
 
 ## Technical Details from the Paper
 
-### Dynamic Speculation Approach
+### Core Implementation 1: Memory Dependence Prediction Table (MDPT)
 
-The paper proposes using **history-based prediction** for memory dependences:
+The MDPT is the heart of the prediction mechanism, enabling the processor to learn from past dependence behavior.
 
-1. **Store-Load Pair Tracking**
-   - Identify which loads depend on which stores
-   - Build confidence through repeated observations
-   - Make speculation decision based on history
+#### MDPT Structure
 
-2. **Confidence Mechanisms**
-   - High confidence → speculate independence
-   - Low confidence → enforce dependence (wait)
-   - Adaptive based on mis-speculation rate
+**Table Organization**:
+```
+Index: Hash of Store PC ⊕ Load PC
+Entry Fields:
+├─ Valid Bit (V): Indicates if entry contains valid data
+├─ Store PC: Program counter of the store instruction
+├─ Load PC: Program counter of the load instruction  
+├─ Confidence Counter: Saturating counter for prediction strength
+└─ Distance: Number of instructions between store and load
+```
 
-3. **Synchronization Points**
-   - Insert checks at critical points
-   - Verify speculated values before commit
-   - Ensure correctness despite speculation
+#### MDPT Operation
+
+**1. Lookup Phase** (During Instruction Fetch/Decode):
+- Hash the load's PC with recent store PCs
+- Access MDPT to check for known dependencies
+- Decision based on entry:
+  ```
+  if (MDPT_hit && confidence >= threshold):
+      Load waits for predicted dependent store
+  else:
+      Load executes speculatively
+  ```
+
+**2. Training Phase** (On Mis-speculation):
+- When violation detected:
+  ```
+  MDPT[hash(store_PC, load_PC)].valid = 1
+  MDPT[hash(store_PC, load_PC)].store_PC = violating_store_PC
+  MDPT[hash(store_PC, load_PC)].load_PC = violating_load_PC
+  MDPT[hash(store_PC, load_PC)].confidence++  // Increase confidence
+  MDPT[hash(store_PC, load_PC)].distance = instruction_distance
+  ```
+
+**3. Aging Phase** (On Correct Speculation):
+- When speculation succeeds:
+  ```
+  if (MDPT_hit && no_violation):
+      MDPT[index].confidence--  // Decrease confidence
+      if (confidence == 0):
+          MDPT[index].valid = 0  // Evict entry
+  ```
+
+#### MDPT Key Features
+
+1. **Adaptive Learning**: Confidence counter adapts to changing program behavior
+2. **Low Storage**: Typical size: 512-4K entries (small compared to caches)
+3. **Fast Access**: Single-cycle lookup in parallel with instruction decode
+4. **Collision Handling**: Uses confidence to resolve hash collisions
+
+#### MDPT Example Scenario
+
+**Code Pattern**:
+```c
+for (i = 0; i < N; i++) {
+    A[i] = B[i] + C[i];      // Store at PC=0x1000
+    sum += A[i-k];           // Load at PC=0x1008
+}
+```
+
+**MDPT Behavior**:
+- **First iteration (i=0)**: No MDPT entry → Load speculates (likely correct if k > 0)
+- **If violation occurs (i==k)**: MDPT learns dependency
+  - Entry created: {PC_store=0x1000, PC_load=0x1008, confidence=1}
+- **Subsequent iterations**: Load waits for store when i >= k
+- **If k changes**: Confidence may decay if no violations occur
+
+### Core Implementation 2: Memory Dependence Synchronization Table (MDST)
+
+The MDST manages the actual synchronization between dependent instructions, ensuring loads wait for the correct stores.
+
+#### MDST Structure
+
+**Table Organization**:
+```
+Index: Hash of Load PC or Sequential ID
+Entry Fields:
+├─ Valid Bit (V): Entry is active
+├─ Store ID: Identifier of the store this load must wait for
+├─ Load ID: Identifier of this load instruction
+├─ Synchronization Flags:
+│  ├─ Address_Ready: Store address has been computed
+│  ├─ Value_Ready: Store value is available
+│  └─ Forwarding_Enable: Can forward from store to load
+├─ Wait Condition: Conditions that must be met before load executes
+└─ Forwarding Path: Pointer to store queue entry for value forwarding
+```
+
+#### MDST Operation
+
+**1. Allocation Phase** (When Predicted Dependence Found):
+```
+When load fetched and MDPT indicates dependency:
+    MDST_entry = allocate()
+    MDST_entry.load_ID = current_load_ID
+    MDST_entry.store_ID = predicted_store_ID (from MDPT distance)
+    MDST_entry.wait_condition = STORE_ADDRESS_READY
+    Mark load as "must synchronize"
+```
+
+**2. Synchronization Phase** (During Execution):
+```
+When store computes address:
+    MDST[load_ID].address_ready = true
+    if (store_address == predicted_address):
+        Enable forwarding path
+        MDST[load_ID].forwarding_enable = true
+    
+When store value ready:
+    MDST[load_ID].value_ready = true
+    Signal waiting load to proceed
+    Forward value directly from store buffer
+```
+
+**3. Release Phase** (After Load Executes):
+```
+When load completes with forwarded value:
+    Verify no younger stores to same address executed first
+    if (verification_passed):
+        MDST[load_ID].valid = 0  // Free entry
+        Commit load result
+    else:
+        Trigger recovery (back to Figure 3 part d)
+```
+
+#### MDST Key Features
+
+1. **Precise Synchronization**: Loads wait only for specific stores, not all stores
+2. **Store-to-Load Forwarding**: Value can bypass memory hierarchy
+   ```
+   Store Buffer → Forwarding Network → Load Operand
+   (1 cycle latency vs. L1 cache 3-4 cycles)
+   ```
+3. **Multiple Outstanding Dependencies**: Table supports multiple simultaneous synchronizations
+4. **Dynamic Binding**: Store ID can be determined dynamically based on program counter and instruction ordering
+
+#### MDST Example Scenario
+
+**Code with Certain Dependency**:
+```c
+int *p = malloc(sizeof(int));
+*p = 42;           // Store at PC=0x2000, ID=S100
+x = *p;            // Load at PC=0x2008, ID=L200
+```
+
+**MDST Execution**:
+1. **Fetch Load L200**:
+   - MDPT lookup: Hit (100% confidence dependency on recent store)
+   - Allocate MDST[L200]: {store_ID=S100, wait=ADDRESS_READY}
+2. **Store S100 executes**:
+   - Address computed: 0x7fff1234
+   - Update MDST[L200]: {address_ready=true, forwarding_path=StoreQueue[S100]}
+3. **Store S100 value ready**:
+   - Value=42 available in store buffer
+   - Update MDST[L200]: {value_ready=true}
+   - Wake up Load L200
+4. **Load L200 executes**:
+   - Bypass memory, read value=42 from StoreQueue[S100] via forwarding path
+   - Latency: 1 cycle (forwarding) vs. 50+ cycles (if flushed to memory)
+   - Free MDST[L200] entry
+
+### MDPT + MDST Integration
+
+The two tables work together in a prediction-synchronization loop:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Instruction Fetch                   │
+│                         ↓                            │
+│         Load Instruction at PC=0xABCD                │
+└─────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────┐
+│                   MDPT Lookup                        │
+│   Index = hash(load_PC ⊕ recent_store_PCs)         │
+│                         ↓                            │
+│   Found entry: {Store PC=0xAB00, Confidence=High}   │
+└─────────────────────────────────────────────────────┘
+                          ↓
+            ┌────────────┴────────────┐
+            │                         │
+     NO DEPENDENCE              DEPENDENCE PREDICTED
+            │                         │
+            ↓                         ↓
+   ┌────────────────┐      ┌─────────────────────────┐
+   │ Speculative    │      │    MDST Allocation      │
+   │ Execution      │      │  Create sync entry:     │
+   │                │      │  - Store ID from MDPT   │
+   │ Load proceeds  │      │  - Wait conditions      │
+   └────────────────┘      │  - Forwarding setup     │
+            │              └─────────────────────────┘
+            ↓                         ↓
+   ┌────────────────┐      ┌─────────────────────────┐
+   │ Verification   │      │   Synchronization       │
+   │ Check vs Store │      │  Load waits for store   │
+   │ Queue          │      │  Value forwarded        │
+   └────────────────┘      └─────────────────────────┘
+            │                         │
+    ┌───────┴────────┐                │
+    │                │                │
+ CORRECT        VIOLATION              │
+    │                │                │
+    ↓                ↓                ↓
+┌────────┐    ┌────────────┐   ┌──────────┐
+│Continue│    │Recovery:   │   │ Success: │
+│        │    │- Flush     │   │ Continue │
+│        │    │- Update    │   │          │
+│        │    │  MDPT      │   │          │
+└────────┘    └────────────┘   └──────────┘
+```
+
+### Hardware Implementation Complexity
+
+#### Area Cost:
+- **MDPT**: ~1-2KB SRAM (512 entries × 24-32 bits)
+- **MDST**: ~2-4KB SRAM (depends on LSQ size)
+- **Comparators**: Parallel address comparison logic in LSQ
+- **Total**: <10KB additional storage (tiny vs. 32KB L1 cache)
+
+#### Timing:
+- **MDPT Lookup**: 1 cycle (parallel with decode)
+- **MDST Update**: 1 cycle (when store completes)
+- **Forwarding**: 1 cycle (store buffer to load)
+- **Recovery**: 10-20 cycles (pipeline flush penalty)
+
+#### Power:
+- **Active Power**: Low (small tables, infrequent updates)
+- **Leakage**: Minimal (small SRAM arrays)
+- **Net Benefit**: Performance gain >> power cost
 
 ### Benefits
 
