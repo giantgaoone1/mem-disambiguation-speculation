@@ -8,6 +8,12 @@ This repository contains detailed analysis and documentation of the **Dynamic Sp
 
 ## Documentation
 
+### ⭐ [THREE_QUESTIONS.md](THREE_QUESTIONS.md) - **START HERE**
+Direct, detailed answers to the three specific questions:
+1. MDPT dependence distance: LDID/STID vs LDPC/STPC?
+2. MDST F/E and V entries: What are their functions?
+3. Section 5 evaluation: Core methodology and results?
+
 ### 📄 [PAPER_ANALYSIS.md](PAPER_ANALYSIS.md)
 Comprehensive analysis answering three key questions about the paper:
 1. Does MDPT dependence distance (DIST) use LDID/STID or LDPC/STPC?
