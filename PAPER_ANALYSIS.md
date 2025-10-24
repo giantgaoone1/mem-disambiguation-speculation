@@ -129,6 +129,69 @@ MDST Timeline:
    - After load completes: V=0 (entry freed)
 ```
 
+### How Independent Loads Are Handled:
+
+**Key Question:** What happens when a load has no actual dependence on any store?
+
+**Answer:** Independent loads execute immediately without waiting. The mechanism works as follows:
+
+```
+Load Execution Decision Process:
+┌────────────────────────────────────────────────────────────┐
+│ 1. Load address calculated                                 │
+│    ↓                                                        │
+│ 2. Check MDPT: Does this LDPC have a predicted dependence? │
+│    ├─ NO → Execute immediately (speculate)                 │
+│    └─ YES → Continue to step 3                             │
+│       ↓                                                     │
+│ 3. Check MDST: Is there a matching entry for this load?    │
+│    ├─ NO match → Execute immediately (speculate)           │
+│    └─ Match found → Check F/E bit                          │
+│       ├─ F/E=F (Full) → Execute immediately                │
+│       └─ F/E=E (Empty) → BLOCK and wait                    │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Three Scenarios:**
+
+1. **Truly Independent Load (No Predicted Dependence)**:
+   - MDPT has no entry or low confidence for this LDPC
+   - **Result**: Load executes immediately, no waiting
+   - Example: First time seeing this load, or consistently independent
+
+2. **Predicted Dependent but No Active Synchronization**:
+   - MDPT predicts dependence, but no matching MDST entry exists
+   - **Result**: Load executes immediately (speculates)
+   - Example: Predicted dependent store already completed before load issued
+
+3. **Predicted Dependent with Active Synchronization**:
+   - MDPT predicts dependence AND matching MDST entry exists
+   - **Result**: Check F/E bit to decide wait or proceed
+   - Example: Store in flight, synchronization needed
+
+**Example - Independent Load:**
+
+```assembly
+Store: ST R1 -> [addr1]    ; STPC=0x100, STID=10
+Load:  LD R2 <- [addr2]    ; LDPC=0x200, LDID=15 (different address!)
+
+Execution:
+1. Load reaches execution → Hash(LDPC) → Check MDPT
+2. MDPT lookup: No predicted dependence for LDPC=0x200
+   (or low confidence, or predicts dependence on different STPC)
+3. Decision: No synchronization needed
+4. Result: Load executes immediately without blocking
+```
+
+**False Positives are Acceptable:**
+
+The system tolerates some false positives (predicting dependence when there is none) because:
+- If MDPT incorrectly predicts a dependence but the store completes quickly, F/E=F allows immediate execution
+- If load arrives after store completes, no MDST entry exists, so load proceeds
+- The confidence counter in MDPT will eventually learn and stop predicting false dependences
+
+**Key Insight:** The two-level check (MDPT prediction + MDST lookup) ensures that only truly dependent loads that arrive before their stores complete will be blocked. All other loads, including independent ones, execute without delay.
+
 ---
 
 ## Question 3: Section 5 Experimental Evaluation
