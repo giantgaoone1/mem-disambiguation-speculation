@@ -418,6 +418,293 @@ Recovery when ST completes:
 8. ADD, MUL, SUB automatically re-execute with correct values
 ```
 
+#### Detailed Pipeline Stage-by-Stage Flush and Re-issue Process
+
+**The Question:** How do the specific pipeline stages (Fetch, Decode, Rename, Issue, Execute, Commit) participate in flushing and re-issuing when mis-speculation occurs?
+
+**The Answer:** Each pipeline stage has specific actions during recovery:
+
+**Normal OOO Pipeline Stages:**
+```
+┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌─────────┐   ┌────────┐
+│ FETCH  │→│ DECODE │→│ RENAME │→│ ISSUE  │→│ EXECUTE │→│ COMMIT │
+└────────┘   └────────┘   └────────┘   └────────┘   └─────────┘   └────────┘
+     ↓            ↓            ↓            ↓             ↓             ↓
+   I-Cache    Inst Queue  Rename Map   Issue Queue   Func Units     ROB
+                                        (RS)          ALU/MEM
+```
+
+**Recovery Process by Stage:**
+
+**1. DETECTION (Execute/Memory Stage):**
+```
+Timeline: Store completes execution
+─────────────────────────────────────────────────────────
+Cycle N: Store ST[10] writes to [addr] in memory system
+         Memory system checks: "Did any younger load read from [addr]?"
+         
+         Search mechanism:
+         - Store Queue (SQ) broadcasts address [addr]
+         - Load Queue (LQ) has entries for all in-flight loads
+         - Each LQ entry has: address, LDID, ROB pointer
+         - CAM (Content Addressable Memory) search in LQ
+         
+         Result: Find LD[11] read from [addr] with older data
+         Trigger: Assert mis-speculation signal with ROB[11] as restart point
+```
+
+**2. FETCH Stage - HALT:**
+```
+Cycle N+1: Fetch stage receives flush signal
+───────────────────────────────────────────────────────
+Actions:
+- STOP fetching new instructions immediately
+- Clear instruction fetch buffer (I-buffer)
+- Invalidate any in-flight I-cache accesses
+- Save mis-speculation PC (LDPC) for later restart
+
+State after:
+- Fetch idle, waiting for PC redirect
+- No new instructions entering pipeline
+```
+
+**3. DECODE Stage - DRAIN:**
+```
+Cycle N+1: Decode stage receives flush signal
+───────────────────────────────────────────────────────
+Actions:
+- Mark all instructions in decode stage as "flushed"
+- Clear decode buffers
+- Stop passing instructions to Rename stage
+- Instructions already decoded but not yet renamed are discarded
+
+State after:
+- Decode stage empty
+- Instruction queue cleared
+```
+
+**4. RENAME Stage - SELECTIVE FLUSH:**
+```
+Cycle N+1: Rename stage receives flush signal + ROB[11] ID
+───────────────────────────────────────────────────────
+Actions:
+- Identify which instructions in rename stage need flushing
+- For each instruction with ROB ID >= 11:
+  • Prevent allocation of new physical registers
+  • Clear from rename pipeline registers
+  • Don't update rename map table
+  
+- Walk back rename map table:
+  • Use ROB to restore architectural → physical mappings
+  • Restore to state just BEFORE LD[11]
+  • Free physical registers allocated by flushed instructions
+  
+Example:
+  Before flush: R1→P10, R2→P25, R3→P30
+  LD[11] allocated P25 (wrong)
+  ADD[12] allocated P30 (wrong)
+  After recovery: R1→P10, R2→P20 (pre-LD state), R3→P22 (pre-ADD state)
+
+State after:
+- Rename map restored to pre-mis-speculation state
+- Physical register free list updated (P25, P30 returned)
+```
+
+**5. ISSUE/DISPATCH Stage - SELECTIVE FLUSH:**
+```
+Cycle N+1: Issue Queue receives flush signal + ROB[11] ID
+───────────────────────────────────────────────────────
+Actions:
+- Scan all Issue Queue (Reservation Station) entries
+- For each entry with ROB_ID >= 11:
+  • Mark as invalid
+  • Remove from issue queue
+  • Free the issue queue slot
+  
+- Update ready bits for remaining instructions:
+  • Physical registers produced by flushed instructions are invalid
+  • Instructions waiting on P25, P30 remain not-ready
+  • Will get correct operands when re-executed
+
+Example Issue Queue before flush:
+  [Entry 0]: ADD R3,R2,R4 | ROB[12] | Waiting on P25 | FLUSH!
+  [Entry 1]: MUL R5,R3,R6 | ROB[13] | Waiting on P30 | FLUSH!
+  [Entry 2]: OR  R8,R9,R10| ROB[15] | Ready          | KEEP (ROB[15] > ROB[11] but older)
+  
+Wait - correction: OR should be flushed if ROB[15] > ROB[11]
+Actually, only flush if instruction is younger (higher ROB ID)
+
+State after:
+- Issue queue contains only instructions with ROB_ID < 11
+- All younger instructions removed
+```
+
+**6. EXECUTE Stage - IN-FLIGHT CANCELLATION:**
+```
+Cycle N+1: Execution units receive flush signal
+───────────────────────────────────────────────────────
+Actions:
+- Check all executing instructions' ROB IDs
+- For multi-cycle operations (DIV, FP ops) in progress:
+  • If ROB_ID >= 11: Cancel operation
+  • Free the functional unit
+  • Don't write back results
+  
+- Memory operations:
+  • Cancel younger loads in Load Queue
+  • Cancel younger stores in Store Queue (tricky - must maintain memory consistency)
+  
+Example:
+  ALU-1: MUL (ROB[13]) executing → CANCEL, free ALU-1
+  FP-DIV: DIV (ROB[9]) executing → CONTINUE (older than flush point)
+
+State after:
+- Only operations from ROB[0..10] continue
+- Functional units freed for re-execution
+```
+
+**7. COMMIT Stage - SELECTIVE COMMIT:**
+```
+Cycle N+1: ROB/Commit stage orchestrates recovery
+───────────────────────────────────────────────────────
+Actions:
+- ROB HEAD pointer: Keep committing older instructions (ROB[0..10])
+- ROB TAIL pointer: Roll back to ROB[11]
+  • tail_ptr = mis_speculation_ROB_ID
+  
+- Free ROB entries:
+  • Mark ROB[11..tail] as invalid
+  • Return entries to free pool
+  • Update ROB tail pointer
+  
+- Physical register freeing:
+  • For each flushed ROB entry:
+    - Get destination physical register
+    - Add to free list (P25, P30, etc.)
+  
+- Architectural state:
+  • NOT modified yet - LD[11] hasn't committed
+  • Architectural registers still have correct values
+  • Only speculative state is discarded
+
+ROB State Transition:
+  Before: [0..10 valid] [11..14 valid] [15..31 free]
+  After:  [0..10 valid] [11..31 free]
+  
+  ROB[11] entry freed and will be reallocated when LD re-fetches
+
+State after:
+- ROB contains only instructions [0..10]
+- Tail pointer = 11 (ready for new instructions)
+- Older instructions continue committing normally
+```
+
+**8. RESTART - FETCH Stage:**
+```
+Cycle N+2: Fetch restarts from mis-speculated instruction
+───────────────────────────────────────────────────────
+Actions:
+- PC ← saved mis-speculation PC (LDPC)
+- Resume fetching from LD instruction
+- I-cache access for LD and subsequent instructions
+- Fill fetch buffer with new instruction stream
+
+Fetch sequence:
+  Cycle N+2: Fetch LD instruction
+  Cycle N+3: Fetch ADD instruction (dependent)
+  Cycle N+4: Fetch MUL instruction (dependent)
+  etc.
+```
+
+**9. RE-EXECUTION Pipeline Flow:**
+```
+Instructions flow through ALL stages again:
+
+LD Instruction (2nd time through):
+──────────────────────────────────────────────────────
+Cycle N+2:  FETCH    - Fetch LD from I-cache
+Cycle N+3:  DECODE   - Decode LD operation
+Cycle N+4:  RENAME   - Allocate NEW physical register P35 for R2
+                       ROB[11] allocated again (same entry)
+Cycle N+5:  ISSUE    - Place in issue queue, wait for address
+Cycle N+6:  EXECUTE  - Calculate address, access memory
+                       NOW reads correct value from ST[10]!
+Cycle N+7:  COMMIT   - Write P35 to architectural register R2
+
+ADD Instruction (dependent, 2nd time):
+──────────────────────────────────────────────────────
+Cycle N+3:  FETCH    - Fetch ADD from I-cache
+Cycle N+4:  DECODE   - Decode ADD operation
+Cycle N+5:  RENAME   - Allocate NEW physical register P36 for R3
+                       Reads source P35 (new LD result)
+                       ROB[12] allocated again
+Cycle N+6:  ISSUE    - Place in issue queue, wait for P35
+Cycle N+7:  EXECUTE  - P35 ready (from LD), execute with CORRECT value
+Cycle N+8:  COMMIT   - Write P36 to architectural register R3
+
+Key differences:
+- Different physical registers allocated (P35, P36 vs old P25, P30)
+- Same ROB slots reused (ROB[11], ROB[12])
+- Instructions execute with CORRECT data this time
+- Dependent instructions naturally get correct operands through register renaming
+```
+
+**Complete Timeline Example:**
+
+```
+Cycle  Stage Actions
+────── ─────────────────────────────────────────────────────────────
+N      ST[10] completes, detects LD[11] mis-speculation
+       
+N+1    FLUSH: All stages freeze/drain
+       - Fetch: Halt
+       - Decode: Clear
+       - Rename: Walk back mapping, free P25, P30
+       - Issue: Remove ROB[11..14] entries
+       - Execute: Cancel MUL[13]
+       - Commit: Free ROB[11..14]
+       
+N+2    RESTART: PC ← LDPC
+       - Fetch: Begin fetching LD instruction
+       
+N+3    - Fetch: LD instruction in decode
+       - Decode: LD being decoded
+       
+N+4    - Fetch: ADD instruction fetched
+       - Decode: LD being renamed → allocate P35
+       - Rename: LD gets ROB[11], maps R2→P35
+       
+N+5    - Fetch: MUL instruction fetched
+       - Decode: ADD being decoded
+       - Rename: ADD being renamed → allocate P36
+       - Issue: LD waiting in issue queue
+       
+N+6    - Execute: LD accesses memory, reads CORRECT data from ST[10]
+       - Issue: ADD waiting for P35
+       
+N+7    - Commit: LD commits, P35 has correct value
+       - Execute: ADD executes with correct P35
+       
+N+8    - Commit: ADD commits, P36 has correct value
+       - Execute: MUL executes with correct P36
+```
+
+**Key Insights:**
+
+1. **Pipeline Stages Coordinate:** Each stage has specific cleanup responsibilities
+2. **Selective Flush:** Only younger instructions (ROB_ID ≥ flush_point) are affected
+3. **Older Instructions Continue:** Instructions older than flush point commit normally
+4. **Natural Re-execution:** Re-fetched instructions flow through entire pipeline normally
+5. **Register Renaming Handles Dependencies:** Physical registers encode data flow automatically
+6. **ROB is Central:** ROB sequence numbers determine what to flush
+7. **No Explicit Dependency Tracking Needed:** Dependencies implicit in physical register names
+
+**Why This is Expensive (10-20 cycles):**
+- Cycle N+1: Detect and flush (1-2 cycles)
+- Cycle N+2 to N+7: Re-fetch and re-execute LD (5+ cycles)
+- Dependent instructions follow (additional cycles)
+- Cache misses can make it even longer
+
 **Paper's Contribution:**
 
 The paper's MDPT/MDST mechanism **prevents** these mis-speculations from happening in the first place by:
