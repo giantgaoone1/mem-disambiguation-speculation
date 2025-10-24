@@ -239,6 +239,129 @@ The experimental evaluation assesses the performance impact of dynamic memory de
    - Pipeline flushes when dependence is violated
    - Re-execution of speculated instructions
 
+#### Detailed: Mis-speculation Recovery in OOO Pipeline with ROB
+
+**The Question:** When a load mis-speculates (reads wrong data), how does the processor track and re-execute all dependent instructions?
+
+**The Answer:** The ROB (Reorder Buffer) and register dependency tracking mechanisms handle this automatically.
+
+**Key Structures for Dependency Tracking:**
+
+1. **ROB (Reorder Buffer)**:
+   - Maintains program order of all in-flight instructions
+   - Each ROB entry tracks: instruction type, destination register, ready bit, result value
+   - When mis-speculation detected, ROB provides sequential list of younger instructions
+
+2. **Register Rename Map Table**:
+   - Maps logical registers to physical registers
+   - Tracks producer-consumer relationships via physical register IDs
+   - Each physical register has a list of consuming instructions
+
+3. **Issue Queue / Reservation Stations**:
+   - Instructions wait here until source operands are ready
+   - Contains explicit dependency information (which physical registers needed)
+   - When a register is invalidated, dependent instructions are marked not-ready
+
+**Mis-speculation Recovery Process:**
+
+```
+Recovery Steps When Load Mis-speculates:
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. DETECTION: Store completes and detects address match with    │
+│    younger load that already executed with wrong data           │
+│    ↓                                                             │
+│ 2. IDENTIFY MIS-SPECULATED LOAD:                                │
+│    - Search ROB for load instruction that read wrong value      │
+│    - ROB entry contains LDID/sequence number                    │
+│    ↓                                                             │
+│ 3. FLUSH YOUNGER INSTRUCTIONS:                                  │
+│    - All ROB entries after the mis-speculated load are flushed  │
+│    - Program order maintained by ROB makes this simple:         │
+│      for (entry = load_entry + 1; entry < ROB_tail; entry++)   │
+│          flush(entry);                                          │
+│    ↓                                                             │
+│ 4. RESTORE REGISTER MAPPINGS:                                   │
+│    - Use ROB checkpointing or walk-back mechanism               │
+│    - Restore rename map to state at mis-speculated load         │
+│    ↓                                                             │
+│ 5. RESTART FETCH:                                               │
+│    - PC set to mis-speculated load instruction                  │
+│    - Load re-executes with correct data from now-completed store│
+│    ↓                                                             │
+│ 6. RE-EXECUTE DEPENDENTS:                                       │
+│    - Dependent instructions naturally re-execute as they        │
+│      are re-fetched and flow through pipeline again             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Dependency Tracking Mechanisms:**
+
+The processor doesn't need a special "dependence table" for recovery because dependencies are implicitly tracked through:
+
+1. **Physical Register Dependencies**:
+   ```
+   Example:
+   LD  R1, [addr]    → produces P10 (physical reg for R1)
+   ADD R2, R1, R3    → consumes P10, produces P11
+   MUL R4, R2, R5    → consumes P11, produces P12
+   
+   If LD mis-speculates:
+   - Flush LD and younger instructions
+   - P10, P11, P12 become invalid
+   - ADD and MUL automatically re-execute when re-fetched
+   ```
+
+2. **ROB Sequential Order**:
+   - ROB entry numbers provide implicit ordering
+   - No explicit dependency graph needed
+   - Simply flush all entries after mis-speculated instruction
+
+3. **Scoreboarding in Issue Queue**:
+   - Each instruction tracks which physical registers it needs
+   - When flush occurs, these entries are cleared
+   - Re-fetched instructions get new issue queue entries
+
+**Why This Works Efficiently:**
+
+- **Program order in ROB**: Makes identifying younger instructions trivial
+- **Register renaming**: Physical registers encode data flow dependencies
+- **Selective replay**: Can flush just from mis-speculation point, not entire pipeline
+- **No explicit dependency graph**: Dependencies implicit in register names
+
+**Example Scenario:**
+
+```assembly
+Instruction Stream in ROB:
+ROB[10]: ST  R1, [addr]     STID=42  (in flight)
+ROB[11]: LD  R2, [addr]     LDID=43  (speculated early - got OLD data!)
+ROB[12]: ADD R3, R2, R4              (used wrong R2 value)
+ROB[13]: MUL R5, R3, R6              (used wrong R3 value)
+ROB[14]: SUB R7, R5, R8              (used wrong R5 value)
+
+Recovery when ST completes:
+1. Detect: ST[10] wrote to [addr], LD[11] read from [addr] before ST
+2. Compare values: LD read wrong data (from older store)
+3. Flush ROB[11], ROB[12], ROB[13], ROB[14]
+4. Clear issue queue entries for these instructions
+5. Invalidate physical registers produced by these instructions
+6. Restart fetch at LD instruction
+7. LD re-executes, now reads correct value from ST[10]
+8. ADD, MUL, SUB automatically re-execute with correct values
+```
+
+**Paper's Contribution:**
+
+The paper's MDPT/MDST mechanism **prevents** these mis-speculations from happening in the first place by:
+- Predicting which loads depend on which stores (MDPT)
+- Synchronizing execution so load waits for store (MDST)
+- Avoiding the expensive recovery process described above
+
+**Cost Comparison:**
+
+- **Without MDPT/MDST**: ~10-20 cycles per mis-speculation (flush + refetch + re-execute)
+- **With MDPT/MDST**: ~1-2 cycles to check prediction + wait if needed
+- **Benefit**: 10x reduction in cost when dependence exists
+
 4. **Hardware Overhead**:
    - MDPT size vs. performance trade-off
    - MDST size vs. performance trade-off
