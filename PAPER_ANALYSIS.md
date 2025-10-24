@@ -135,6 +135,75 @@ MDST Timeline:
 
 **Answer:** Independent loads execute immediately without waiting. The mechanism works as follows:
 
+#### How DIST is Used for Prediction Matching:
+
+When a load instruction arrives, the system uses DIST to identify which specific store instance it depends on:
+
+**Step-by-step DIST Usage:**
+
+1. **MDPT Lookup** (using LDPC):
+   - Hash the load's program counter (LDPC)
+   - MDPT returns: predicted STPC and DIST value
+   - Example: MDPT[Hash(LDPC)] → {STPC=0x1000, DIST=5}
+
+2. **Calculate Expected Store ID**:
+   - Current load has LDID (assigned when load issued)
+   - **Expected STID = LDID - DIST**
+   - Example: If LDID=47 and DIST=5, then Expected STID=42
+
+3. **MDST Matching** (using Expected STID):
+   - Search MDST for entry with matching STPC AND STID
+   - Look for: {STPC=0x1000, STID=42}
+   - This identifies the specific store instance the load depends on
+
+4. **Synchronization Decision**:
+   - If match found with F/E=E → Load waits for that specific store
+   - If match found with F/E=F → Load proceeds (store completed)
+   - If no match → Load proceeds (store not in flight or already done)
+
+**Concrete Example:**
+
+```
+Scenario: Loop executing, multiple store-load pairs
+
+Iteration 1:
+  ST R1, [addr]  (STID=10) → Still executing
+  ...
+  LD R2, [addr]  (LDID=15) → Load arrives
+  
+  MDPT lookup with Hash(LDPC):
+    Returns: STPC=0x1000, DIST=5
+  
+  Calculate: Expected STID = 15 - 5 = 10
+  
+  MDST search: Look for {STPC=0x1000, STID=10}
+    Found! Entry shows F/E=E (store pending)
+    Decision: BLOCK load, wait for STID=10 to complete
+    
+Iteration 2 (same code, different instance):
+  ST R1, [addr]  (STID=50) → Completed fast!
+  ...
+  LD R2, [addr]  (LDID=55) → Load arrives
+  
+  MDPT lookup: STPC=0x1000, DIST=5
+  Calculate: Expected STID = 55 - 5 = 50
+  
+  MDST search: Look for {STPC=0x1000, STID=50}
+    Not found! (Store already completed and freed MDST entry)
+    Decision: Load proceeds immediately
+```
+
+**Why DIST is Critical:**
+
+- **Instance Identification**: DIST identifies which specific store instance (not just which store PC) the load depends on
+- **Multiple In-Flight**: Multiple instances of same store/load can be in flight simultaneously (loop unrolling, superscalar execution)
+- **Precise Synchronization**: LDID - DIST pinpoints exact store that produces the value the load needs
+
+Without DIST, the system could only match by PC, causing:
+- False dependencies between unrelated instances
+- Over-synchronization (waiting for wrong store instance)
+- Under-synchronization (missing the correct store instance)
+
 ```
 Load Execution Decision Process:
 ┌────────────────────────────────────────────────────────────┐
